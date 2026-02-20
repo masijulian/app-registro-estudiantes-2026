@@ -4,7 +4,7 @@
   import "@fontsource/manrope/latin-700.css";
   import "@picocss/pico/css/pico.min.css";
   import "remixicon/fonts/remixicon.css";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
 
   type SubjectProfileId = "informatics" | "english";
 
@@ -254,7 +254,10 @@
   let selectedSubjectId = courses[0].subjects[0].id;
   let activeStudentId = "";
   let filterText = "";
+  let filterDebounced = "";
+  let filterTimer: ReturnType<typeof setTimeout> | null = null;
   let csvInput: HTMLInputElement;
+  let jsonInput: HTMLInputElement;
   let importFeedback = "";
   let editingCourseId: string | null = null;
   let editingCourseName = "";
@@ -290,6 +293,40 @@
   let exportTempFrom = "";
   let exportTempTo = "";
 
+  // Toast state
+  let toastMessage = "";
+  let toastVisible = false;
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // History lazy load
+  let historyLimit = 30;
+
+  // Student management
+  let addingStudent = false;
+  let newStudentName = "";
+  let editingStudentId: string | null = null;
+  let editingStudentName = "";
+
+  // Delete confirmation
+  let deleteConfirmId: string | null = null;
+
+  function showToast(msg: string) {
+    toastMessage = msg;
+    toastVisible = true;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      toastVisible = false;
+    }, 2000);
+  }
+
+  function handleFilterInput(value: string) {
+    filterText = value;
+    if (filterTimer) clearTimeout(filterTimer);
+    filterTimer = setTimeout(() => {
+      filterDebounced = value;
+    }, 150);
+  }
+
   onMount(() => {
     hydrated = true;
     const storedCourses = localStorage.getItem(COURSES_KEY);
@@ -309,6 +346,7 @@
     }
     resetNoteForm();
     setDefaultDateRange();
+    filterDebounced = "";
   });
 
   $: if (hydrated) {
@@ -364,7 +402,7 @@
   }
 
   $: filteredStudents = (selectedCourse?.students ?? []).filter((student) =>
-    student.name.toLowerCase().includes(filterText.trim().toLowerCase()),
+    student.name.toLowerCase().includes(filterDebounced.trim().toLowerCase()),
   );
 
   $: activeRecords = records.filter(
@@ -373,6 +411,25 @@
       entry.courseId === selectedCourseId &&
       entry.subjectId === selectedSubjectId,
   );
+
+  // Count records per student for today
+  function studentTodayCount(studentId: string): number {
+    const today = new Date().toISOString().slice(0, 10);
+    return records.filter(
+      (r) =>
+        r.studentId === studentId &&
+        r.courseId === selectedCourseId &&
+        r.timestamp.slice(0, 10) === today,
+    ).length;
+  }
+
+  function studentTotalCount(studentId: string): number {
+    return records.filter(
+      (r) =>
+        r.studentId === studentId &&
+        r.courseId === selectedCourseId,
+    ).length;
+  }
 
   function resetNoteForm() {
     noteForm = defaultNoteForm();
@@ -444,16 +501,29 @@
     resetAssessment(firstSubject?.profile ?? "informatics");
   }
 
-  function openStudentModal(studentId: string) {
+  async function openStudentModal(studentId: string) {
     activeStudentId = studentId;
     showModal = true;
     modalTab = "nota";
+    historyLimit = 30;
     resetNoteForm();
     resetAssessment(currentProfileId);
+    await tick();
+    const modal = document.querySelector('.modal');
+    if (modal) modal.scrollTop = 0;
   }
 
   function closeModal() {
     showModal = false;
+  }
+
+  // Navigate to next/previous student
+  function navigateStudent(direction: 1 | -1) {
+    const students = selectedCourse.students;
+    const currentIndex = students.findIndex((s) => s.id === activeStudentId);
+    if (currentIndex === -1) return;
+    const nextIndex = (currentIndex + direction + students.length) % students.length;
+    openStudentModal(students[nextIndex].id);
   }
 
   function startCourseEdit(course: Course) {
@@ -492,6 +562,58 @@
     editingCourseName = "Nuevo curso";
   }
 
+  // Student management
+  function addStudent() {
+    const name = newStudentName.trim();
+    if (!name) return;
+    const timestamp = Date.now().toString(36);
+    const student: Student = {
+      id: `${selectedCourseId}-${timestamp}`,
+      name,
+    };
+    courses = courses.map((c) =>
+      c.id !== selectedCourseId ? c : { ...c, students: [...c.students, student] },
+    );
+    newStudentName = "";
+    addingStudent = false;
+    showToast(`${name} agregado`);
+  }
+
+  function startEditStudent(student: Student) {
+    editingStudentId = student.id;
+    editingStudentName = student.name;
+  }
+
+  function saveStudentEdit() {
+    const name = editingStudentName.trim();
+    if (name && editingStudentId) {
+      courses = courses.map((c) =>
+        c.id !== selectedCourseId
+          ? c
+          : {
+              ...c,
+              students: c.students.map((s) =>
+                s.id !== editingStudentId ? s : { ...s, name },
+              ),
+            },
+      );
+    }
+    editingStudentId = null;
+  }
+
+  function deleteStudent(studentId: string) {
+    courses = courses.map((c) =>
+      c.id !== selectedCourseId
+        ? c
+        : { ...c, students: c.students.filter((s) => s.id !== studentId) },
+    );
+    if (activeStudentId === studentId) {
+      activeStudentId = "";
+      showModal = false;
+    }
+    showToast("Alumno eliminado");
+  }
+
   $: if (selectedCourseId) importFeedback = "";
 
   function handleCSVFile(event: Event) {
@@ -500,20 +622,32 @@
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
+    const currentCount = selectedCourse.students.length;
     const reader = new FileReader();
     reader.onload = (e) => {
       const text = e.target?.result as string;
       const students = parseCSVStudents(text, courseId);
       if (!students.length) {
-        importFeedback = "No se encontraron alumnos válidos en el archivo.";
+        importFeedback = "No se encontraron alumnos validos en el archivo.";
       } else {
+        if (currentCount > 0) {
+          const ok = confirm(
+            `Esto reemplazara los ${currentCount} alumnos actuales con ${students.length} nuevos. ¿Continuar?`,
+          );
+          if (!ok) {
+            importFeedback = "Importacion cancelada.";
+            return;
+          }
+        }
         courses = courses.map((course) =>
           course.id !== courseId ? course : { ...course, students },
         );
         activeStudentId = "";
         showModal = false;
         filterText = "";
+        filterDebounced = "";
         importFeedback = `${students.length} alumnos importados.`;
+        showToast(`${students.length} alumnos importados`);
       }
     };
     reader.onerror = () => {
@@ -605,7 +739,7 @@
 
     records = [...newEntries, ...records];
     resetNoteForm();
-    modalTab = "historial";
+    showToast("Nota guardada");
   }
 
   function saveAssessment() {
@@ -632,6 +766,8 @@
       fields.evaluacion = Math.round(assessmentForm.evaluacion * 10) / 10;
     }
 
+    if (!Object.keys(fields).length && !assessmentForm.comentarios.trim()) return;
+
     const entry: RecordEntry = {
       id: `${now.getTime().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
       courseId: selectedCourseId,
@@ -646,11 +782,20 @@
 
     records = [entry, ...records];
     resetAssessment(currentProfileId);
-    modalTab = "historial";
+    showToast("Calificacion guardada");
   }
 
   function deleteRecord(id: string) {
-    records = records.filter((entry) => entry.id !== id);
+    if (deleteConfirmId === id) {
+      records = records.filter((entry) => entry.id !== id);
+      deleteConfirmId = null;
+      showToast("Registro eliminado");
+    } else {
+      deleteConfirmId = id;
+      setTimeout(() => {
+        if (deleteConfirmId === id) deleteConfirmId = null;
+      }, 3000);
+    }
   }
 
   function setDefaultDateRange() {
@@ -681,22 +826,28 @@
     return fieldLabels[fieldId] ?? fieldId;
   }
 
-  function exportWorkbook() {
+  function getCourseTitleById(courseId: string): string {
+    return courses.find((c) => c.id === courseId)?.title ?? courseId.toUpperCase();
+  }
+
+  function buildExportData() {
     exportError = "";
+    const from = exportTempFrom;
+    const to = exportTempTo;
     if (!records.length) {
       exportError = "No hay registros para exportar.";
-      return;
+      return null;
     }
-    if (!dateFrom || !dateTo) {
+    if (!from || !to) {
       exportError = "Marca rango de fechas.";
-      return;
+      return null;
     }
-    const start = new Date(dateFrom);
-    const end = new Date(dateTo);
+    const start = new Date(from);
+    const end = new Date(to);
     end.setHours(23, 59, 59, 999);
     if (isNaN(start.getTime()) || isNaN(end.getTime()) || start > end) {
       exportError = "Rango de fechas invalido.";
-      return;
+      return null;
     }
 
     const filtered = records.filter((entry) => {
@@ -706,7 +857,7 @@
 
     if (!filtered.length) {
       exportError = "No hay registros en ese rango.";
-      return;
+      return null;
     }
 
     const baseFieldOrder = [
@@ -748,7 +899,7 @@
       if (!aggregator.has(key)) {
         aggregator.set(key, {
           student: entry.studentName,
-          course: entry.courseId.toUpperCase(),
+          course: getCourseTitleById(entry.courseId),
           subject: entry.profileId === "informatics" ? "Informatica" : "Ingles",
           fields: {},
         });
@@ -770,7 +921,7 @@
           current.sum += numericValue;
           current.count += 1;
         } else if (typeof raw === "string") {
-          current.lastText = raw.replace(/[^\x20-\x7E¡-ÿ]/g, "").trim();
+          current.lastText = raw.replace(/[^\x20-\x7E\u00A1-\u00FF]/g, "").trim();
         }
         agg.fields[fieldId] = current;
       });
@@ -802,6 +953,14 @@
       rows.push(row);
     });
 
+    return { rows, from, to };
+  }
+
+  function exportWorkbook() {
+    const data = buildExportData();
+    if (!data) return;
+    const { rows, from, to } = data;
+
     const tableHtml = rows
       .map(
         (cols) =>
@@ -815,12 +974,81 @@
       .join("");
     const html = `<html><head><meta charset="UTF-8"></head><body><table>${tableHtml}</table></body></html>`;
     const blob = new Blob([html], { type: "application/vnd.ms-excel" });
+    downloadBlob(blob, `registro-estudiantes_${from}_a_${to}.xls`);
+    showToast("Archivo XLS exportado");
+    closeExportModal();
+  }
+
+  function exportCSV() {
+    const data = buildExportData();
+    if (!data) return;
+    const { rows, from, to } = data;
+
+    const csvContent = rows
+      .map((row) =>
+        row.map((cell) => `"${(cell ?? "").replace(/"/g, '""')}"`).join(","),
+      )
+      .join("\n");
+    const bom = "\uFEFF";
+    const blob = new Blob([bom + csvContent], { type: "text/csv;charset=utf-8" });
+    downloadBlob(blob, `registro-estudiantes_${from}_a_${to}.csv`);
+    showToast("Archivo CSV exportado");
+    closeExportModal();
+  }
+
+  function downloadBlob(blob: Blob, filename: string) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `registro-estudiantes_${dateFrom}_a_${dateTo}.xls`;
+    link.download = filename;
     link.click();
     URL.revokeObjectURL(url);
+  }
+
+  // Backup & Restore
+  function exportBackup() {
+    const data = {
+      version: 1,
+      timestamp: new Date().toISOString(),
+      courses,
+      records,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json",
+    });
+    downloadBlob(blob, `backup-registro_${new Date().toISOString().slice(0, 10)}.json`);
+    showToast("Backup exportado");
+  }
+
+  function handleJsonImport(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target?.result as string);
+        if (data.courses && Array.isArray(data.courses)) {
+          const ok = confirm(
+            `Se importaran ${data.courses.length} cursos y ${data.records?.length ?? 0} registros. Esto reemplazara todos los datos actuales. ¿Continuar?`,
+          );
+          if (!ok) return;
+          courses = data.courses;
+          if (data.records) records = data.records;
+          selectedCourseId = courses[0]?.id ?? "";
+          selectedSubjectId = courses[0]?.subjects?.[0]?.id ?? "";
+          activeStudentId = "";
+          showModal = false;
+          showToast("Backup restaurado");
+        } else {
+          showToast("Archivo de backup invalido");
+        }
+      } catch {
+        showToast("Error al leer backup");
+      }
+    };
+    reader.readAsText(file, "UTF-8");
+    input.value = "";
   }
 
   const formatStamp = (iso: string) => {
@@ -839,7 +1067,16 @@
 
 <svelte:head>
   <title>Registro de estudiantes</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 </svelte:head>
+
+<!-- Toast -->
+{#if toastVisible}
+  <div class="toast" class:show={toastVisible}>
+    <i class="ri-check-line" aria-hidden="true"></i>
+    {toastMessage}
+  </div>
+{/if}
 
 <main class="page">
   <header class="hero">
@@ -858,19 +1095,36 @@
           disabled={!records.length}
         >
           <i class="ri-file-text-line" aria-hidden="true"></i>
-          <span>Exportar a hoja</span>
+          <span>Exportar</span>
+        </button>
+        <button class="ghost" type="button" on:click={exportBackup}>
+          <i class="ri-download-2-line" aria-hidden="true"></i>
+          <span>Backup</span>
+        </button>
+        <input
+          type="file"
+          accept=".json"
+          bind:this={jsonInput}
+          on:change={handleJsonImport}
+          style="display:none"
+        />
+        <button class="ghost" type="button" on:click={() => jsonInput.click()}>
+          <i class="ri-upload-2-line" aria-hidden="true"></i>
+          <span>Restaurar</span>
         </button>
       </div>
     </div>
   </header>
 
   {#if showExportModal}
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div
       class="modal-backdrop export"
       on:click={(event) => {
         if (event.target === event.currentTarget) closeExportModal();
       }}
     >
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
       <div class="export-card" on:click|stopPropagation>
         <div class="export-header">
           <div>
@@ -913,18 +1167,13 @@
           <button class="ghost" type="button" on:click={closeExportModal}
             >Cancelar</button
           >
-          <button
-            class="primary"
-            type="button"
-            on:click={() => {
-              dateFrom = exportTempFrom;
-              dateTo = exportTempTo;
-              exportWorkbook();
-              if (!exportError) closeExportModal();
-            }}
-          >
-            <i class="ri-check-line" aria-hidden="true"></i>
-            <span>Exportar</span>
+          <button class="primary" type="button" on:click={exportCSV}>
+            <i class="ri-file-list-3-line" aria-hidden="true"></i>
+            <span>CSV</span>
+          </button>
+          <button class="primary" type="button" on:click={exportWorkbook}>
+            <i class="ri-file-excel-2-line" aria-hidden="true"></i>
+            <span>Excel</span>
           </button>
         </div>
       </div>
@@ -937,7 +1186,6 @@
         <p class="eyebrow">Paso 1</p>
         <h2>Elegir curso</h2>
       </div>
-      <p class="hint"></p>
     </div>
 
     <div class="course-grid">
@@ -948,7 +1196,6 @@
               <input
                 class="course-name-input"
                 bind:value={editingCourseName}
-                autofocus
                 on:blur={saveCourseEdit}
                 on:keydown={(e) => {
                   if (e.key === "Enter") saveCourseEdit();
@@ -975,6 +1222,7 @@
               on:click={() => setCourse(course.id)}
             >
               <span class="course-pill">{course.title}</span>
+              <span class="course-count">{course.students.length} alumnos</span>
             </button>
             <button
               type="button"
@@ -987,7 +1235,7 @@
           {/if}
         </div>
       {/each}
-      <button type="button" class="add-course-btn" on:click={addCourse}>
+      <button type="button" class="add-course-btn" on:click={addCourse} aria-label="Agregar curso">
         <i class="ri-add-line"></i>
       </button>
     </div>
@@ -999,31 +1247,66 @@
         <p class="eyebrow">Paso 2</p>
         <h2>Elegir estudiante</h2>
       </div>
-      <p class="hint">
-        Toca el nombre para abrir el popup de notas y su historial.
-      </p>
     </div>
 
     <div class="toolbar">
       <label class="search">
+        <i class="ri-search-line search-icon" aria-hidden="true"></i>
         <input
-          placeholder="Buscar estudiante"
+          placeholder="Buscar estudiante..."
           autocomplete="off"
-          bind:value={filterText}
+          value={filterText}
+          on:input={(e) => handleFilterInput(e.currentTarget.value)}
           name="search"
         />
+        {#if filterText}
+          <button
+            class="search-clear"
+            type="button"
+            on:click={() => { filterText = ""; filterDebounced = ""; }}
+            aria-label="Limpiar busqueda"
+          >
+            <i class="ri-close-line"></i>
+          </button>
+        {/if}
       </label>
-      <input
-        type="file"
-        accept=".csv"
-        bind:this={csvInput}
-        on:change={handleCSVFile}
-        style="display:none"
-      />
-      <button class="ghost" type="button" on:click={() => csvInput.click()}>
-        <i class="ri-upload-2-line"></i> Importar CSV
-      </button>
+      <div class="toolbar-btns">
+        <input
+          type="file"
+          accept=".csv"
+          bind:this={csvInput}
+          on:change={handleCSVFile}
+          style="display:none"
+        />
+        <button class="ghost compact" type="button" on:click={() => csvInput.click()}>
+          <i class="ri-upload-2-line"></i> CSV
+        </button>
+        <button class="ghost compact" type="button" on:click={() => { addingStudent = true; newStudentName = ""; }}>
+          <i class="ri-user-add-line"></i> Agregar
+        </button>
+      </div>
     </div>
+
+    {#if addingStudent}
+      <div class="add-student-row">
+        <input
+          class="add-student-input"
+          placeholder="Nombre y apellido..."
+          bind:value={newStudentName}
+          on:keydown={(e) => {
+            if (e.key === "Enter") addStudent();
+            if (e.key === "Escape") addingStudent = false;
+          }}
+        />
+        <button class="primary compact" type="button" on:click={addStudent} aria-label="Confirmar agregar alumno">
+          <i class="ri-check-line"></i>
+        </button>
+        <button class="ghost compact" type="button" on:click={() => addingStudent = false} aria-label="Cancelar agregar alumno">
+          <i class="ri-close-line"></i>
+        </button>
+      </div>
+    {/if}
+
     {#if importFeedback}
       <p class="import-feedback">{importFeedback}</p>
     {/if}
@@ -1031,19 +1314,62 @@
     <div class="student-grid">
       {#if filteredStudents.length}
         {#each filteredStudents as student}
-          <button
-            type="button"
-            class="student-card"
-            class:active={student.id === activeStudentId}
-            on:click={() => openStudentModal(student.id)}
-          >
-            <span class="avatar">{initials(student.name)}</span>
-            <div>
-              <p class="name">{student.name}</p>
-              <p class="mini">Toca para abrir ficha</p>
-            </div>
-            <i class="ri-arrow-right-s-line" aria-hidden="true"></i>
-          </button>
+          <div class="student-card-wrap">
+            {#if editingStudentId === student.id}
+              <div class="student-editing">
+                <input
+                  class="student-name-input"
+                  bind:value={editingStudentName}
+                  on:blur={saveStudentEdit}
+                  on:keydown={(e) => {
+                    if (e.key === "Enter") saveStudentEdit();
+                    if (e.key === "Escape") editingStudentId = null;
+                  }}
+                />
+                <button
+                  type="button"
+                  class="student-delete-btn"
+                  on:mousedown|preventDefault
+                  on:click={() => deleteStudent(student.id)}
+                  title="Eliminar alumno"
+                >
+                  <i class="ri-delete-bin-line"></i>
+                </button>
+              </div>
+            {:else}
+              <button
+                type="button"
+                class="student-card"
+                class:active={student.id === activeStudentId}
+                on:click={() => openStudentModal(student.id)}
+              >
+                <span class="avatar" style={`--accent:${selectedCourse.accent}`}>{initials(student.name)}</span>
+                <div class="student-info">
+                  <p class="name">{student.name}</p>
+                  <div class="student-meta">
+                    {#if studentTodayCount(student.id) > 0}
+                      <span class="today-badge">
+                        <span class="today-dot"></span>
+                        hoy: {studentTodayCount(student.id)}
+                      </span>
+                    {/if}
+                    {#if studentTotalCount(student.id) > 0}
+                      <span class="total-count">{studentTotalCount(student.id)} reg.</span>
+                    {/if}
+                  </div>
+                </div>
+                <i class="ri-arrow-right-s-line" aria-hidden="true"></i>
+              </button>
+              <button
+                type="button"
+                class="student-edit-btn"
+                on:click|stopPropagation={() => startEditStudent(student)}
+                title="Editar alumno"
+              >
+                <i class="ri-pencil-line"></i>
+              </button>
+            {/if}
+          </div>
         {/each}
       {:else}
         <p class="empty">No hay estudiantes en esta vista.</p>
@@ -1062,11 +1388,7 @@
         }
       }}
       on:keydown={(event) => {
-        if (
-          event.key === "Escape" ||
-          event.key === "Enter" ||
-          event.key === " "
-        ) {
+        if (event.key === "Escape") {
           event.preventDefault();
           closeModal();
         }
@@ -1086,13 +1408,33 @@
         }}
       >
         <div class="modal-header">
-          <div>
-            <p class="eyebrow">Ficha rapida</p>
-            <h3>
-              {selectedCourse.students.find((s) => s.id === activeStudentId)
-                ?.name}
-            </h3>
-            <p class="mini muted">{selectedCourse.title}</p>
+          <div class="modal-header-left">
+            <button
+              class="nav-btn"
+              type="button"
+              on:click={() => navigateStudent(-1)}
+              aria-label="Alumno anterior"
+              title="Anterior"
+            >
+              <i class="ri-arrow-left-s-line"></i>
+            </button>
+            <div>
+              <p class="eyebrow">Ficha rapida</p>
+              <h3>
+                {selectedCourse.students.find((s) => s.id === activeStudentId)
+                  ?.name}
+              </h3>
+              <p class="mini muted">{selectedCourse.title}</p>
+            </div>
+            <button
+              class="nav-btn"
+              type="button"
+              on:click={() => navigateStudent(1)}
+              aria-label="Alumno siguiente"
+              title="Siguiente"
+            >
+              <i class="ri-arrow-right-s-line"></i>
+            </button>
           </div>
           <button
             class="ghost icon"
@@ -1111,45 +1453,28 @@
               class:active={modalTab === "nota"}
               on:click={() => (modalTab = "nota")}
             >
-              Notas rapidas
+              <i class="ri-sticky-note-line tab-icon" aria-hidden="true"></i>
+              Notas
             </button>
             <button
               type="button"
               class:active={modalTab === "calificacion"}
               on:click={() => (modalTab = "calificacion")}
             >
-              Calificacion
+              <i class="ri-bar-chart-line tab-icon" aria-hidden="true"></i>
+              Calif.
             </button>
             <button
               type="button"
               class:active={modalTab === "historial"}
-              on:click={() => (modalTab = "historial")}
+              on:click={() => { modalTab = "historial"; historyLimit = 30; }}
             >
+              <i class="ri-time-line tab-icon" aria-hidden="true"></i>
               Historial
+              {#if activeRecords.length > 0}
+                <span class="tab-badge">{activeRecords.length}</span>
+              {/if}
             </button>
-          </div>
-          <div class="tab-actions">
-            {#if modalTab === "nota"}
-              <button class="primary" type="button" on:click={saveQuickNotes}>
-                <i class="ri-check-line" aria-hidden="true"></i>
-                <span>Guardar</span>
-              </button>
-              <button class="ghost" type="button" on:click={resetNoteForm}
-                >Limpiar</button
-              >
-            {:else if modalTab === "calificacion"}
-              <button class="primary" type="button" on:click={saveAssessment}>
-                <i class="ri-check-line" aria-hidden="true"></i>
-                <span>Guardar</span>
-              </button>
-              <button
-                class="ghost"
-                type="button"
-                on:click={() => resetAssessment(currentProfileId)}
-              >
-                Limpiar
-              </button>
-            {/if}
           </div>
         </div>
 
@@ -1245,7 +1570,6 @@
               >
                 {noteForm.merito ? "Quitar merito" : "Dar merito"}
               </button>
-              <p class="mini muted">Un toque para sumar, otro para deshacer.</p>
             </div>
 
             <label class="field field-span">
@@ -1257,6 +1581,16 @@
                 name="comment"
               ></textarea>
             </label>
+          </div>
+
+          <div class="sticky-save">
+            <button class="primary save-btn" type="button" on:click={saveQuickNotes}>
+              <i class="ri-check-line" aria-hidden="true"></i>
+              Guardar nota
+            </button>
+            <button class="ghost compact" type="button" on:click={resetNoteForm}>
+              Limpiar
+            </button>
           </div>
         {:else if modalTab === "calificacion"}
           <div class="form-grid modal-grid">
@@ -1284,16 +1618,28 @@
                     </span>
                   </label>
                 </div>
-                <input
-                  type="range"
-                  min={assessmentTemplates[currentProfileId].scale[0].value}
-                  max={assessmentTemplates[currentProfileId].scale.at(-1)
-                    ?.value}
-                  step="1"
-                  value={assessmentForm.criteria[item.id]}
-                  on:input={(event) =>
-                    setCriterion(item.id, Number(event.currentTarget.value))}
-                />
+                <div class="range-row">
+                  <button
+                    class="range-btn"
+                    type="button"
+                    on:click={() => setCriterion(item.id, Math.max(1, assessmentForm.criteria[item.id] - 1))}
+                  >-</button>
+                  <input
+                    type="range"
+                    min={assessmentTemplates[currentProfileId].scale[0].value}
+                    max={assessmentTemplates[currentProfileId].scale.at(-1)
+                      ?.value}
+                    step="1"
+                    value={assessmentForm.criteria[item.id]}
+                    on:input={(event) =>
+                      setCriterion(item.id, Number(event.currentTarget.value))}
+                  />
+                  <button
+                    class="range-btn"
+                    type="button"
+                    on:click={() => setCriterion(item.id, Math.min(10, assessmentForm.criteria[item.id] + 1))}
+                  >+</button>
+                </div>
               </div>
             {/each}
 
@@ -1321,18 +1667,30 @@
                   </span>
                 </label>
               </div>
-              <input
-                type="range"
-                min="1"
-                max="10"
-                step="0.5"
-                value={assessmentForm.trabajoSemana}
-                on:input={(event) =>
-                  setAssessmentNumber(
-                    "trabajoSemana",
-                    Number(event.currentTarget.value),
-                  )}
-              />
+              <div class="range-row">
+                <button
+                  class="range-btn"
+                  type="button"
+                  on:click={() => setAssessmentNumber("trabajoSemana", Math.max(1, assessmentForm.trabajoSemana - 0.5))}
+                >-</button>
+                <input
+                  type="range"
+                  min="1"
+                  max="10"
+                  step="0.5"
+                  value={assessmentForm.trabajoSemana}
+                  on:input={(event) =>
+                    setAssessmentNumber(
+                      "trabajoSemana",
+                      Number(event.currentTarget.value),
+                    )}
+                />
+                <button
+                  class="range-btn"
+                  type="button"
+                  on:click={() => setAssessmentNumber("trabajoSemana", Math.min(10, assessmentForm.trabajoSemana + 0.5))}
+                >+</button>
+              </div>
             </div>
 
             <div class="field">
@@ -1358,18 +1716,30 @@
                   </span>
                 </label>
               </div>
-              <input
-                type="range"
-                min="1"
-                max="10"
-                step="0.5"
-                value={assessmentForm.evaluacion}
-                on:input={(event) =>
-                  setAssessmentNumber(
-                    "evaluacion",
-                    Number(event.currentTarget.value),
-                  )}
-              />
+              <div class="range-row">
+                <button
+                  class="range-btn"
+                  type="button"
+                  on:click={() => setAssessmentNumber("evaluacion", Math.max(1, assessmentForm.evaluacion - 0.5))}
+                >-</button>
+                <input
+                  type="range"
+                  min="1"
+                  max="10"
+                  step="0.5"
+                  value={assessmentForm.evaluacion}
+                  on:input={(event) =>
+                    setAssessmentNumber(
+                      "evaluacion",
+                      Number(event.currentTarget.value),
+                    )}
+                />
+                <button
+                  class="range-btn"
+                  type="button"
+                  on:click={() => setAssessmentNumber("evaluacion", Math.min(10, assessmentForm.evaluacion + 0.5))}
+                >+</button>
+              </div>
             </div>
 
             <label class="field field-span">
@@ -1384,10 +1754,24 @@
               ></textarea>
             </label>
           </div>
+
+          <div class="sticky-save">
+            <button class="primary save-btn" type="button" on:click={saveAssessment}>
+              <i class="ri-check-line" aria-hidden="true"></i>
+              Guardar calificacion
+            </button>
+            <button
+              class="ghost compact"
+              type="button"
+              on:click={() => resetAssessment(currentProfileId)}
+            >
+              Limpiar
+            </button>
+          </div>
         {:else}
           <div class="modal-history">
             {#if activeRecords.length}
-              {#each activeRecords as entry}
+              {#each activeRecords.slice(0, historyLimit) as entry}
                 {#each Object.entries(entry.fields) as [key, value]}
                   <div class="history-card">
                     <div class="history-top">
@@ -1396,11 +1780,11 @@
                         <span class="note-value">{value}</span>
                       </div>
                       <button
-                        class="ghost danger"
+                        class={`ghost ${deleteConfirmId === entry.id ? "danger-confirm" : "danger"}`}
                         type="button"
                         on:click={() => deleteRecord(entry.id)}
                       >
-                        Borrar
+                        {deleteConfirmId === entry.id ? "Confirmar" : "Borrar"}
                       </button>
                     </div>
                     <span class="stamp small"
@@ -1412,6 +1796,15 @@
                   </div>
                 {/each}
               {/each}
+              {#if activeRecords.length > historyLimit}
+                <button
+                  class="ghost load-more"
+                  type="button"
+                  on:click={() => historyLimit += 30}
+                >
+                  Cargar mas ({activeRecords.length - historyLimit} restantes)
+                </button>
+              {/if}
             {:else}
               <p class="empty">
                 Todavia no hay registros para este estudiante.
@@ -1438,6 +1831,8 @@
       #0b1021;
     color: #e8ecf5;
     min-height: 100vh;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
   }
 
   :global(select),
@@ -1451,13 +1846,40 @@
     color: #0b1021;
   }
 
+  /* Toast */
+  .toast {
+    position: fixed;
+    top: 1rem;
+    left: 50%;
+    transform: translateX(-50%) translateY(-20px);
+    background: linear-gradient(135deg, #4ade80, #22d3ee);
+    color: #0b1224;
+    font-weight: 800;
+    padding: 0.65rem 1.2rem;
+    border-radius: 0.85rem;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    box-shadow: 0 8px 32px rgba(74, 222, 128, 0.3);
+    opacity: 0;
+    transition: opacity 0.3s, transform 0.3s;
+    pointer-events: none;
+    font-size: 0.9rem;
+  }
+
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+
   main.page {
     max-width: 1100px;
     margin: 0 auto;
-    padding: 1.25rem;
+    padding: 1rem;
     display: flex;
     flex-direction: column;
-    gap: 1.25rem;
+    gap: 1rem;
   }
 
   .hero {
@@ -1469,7 +1891,7 @@
 
   h1 {
     margin: 0 0 0.25rem 0;
-    font-size: clamp(1.75rem, 3vw, 2.3rem);
+    font-size: clamp(1.5rem, 3vw, 2.3rem);
     color: #f8fafc;
   }
 
@@ -1481,11 +1903,12 @@
   .lede {
     color: #b7c5e0;
     margin-bottom: 0.75rem;
+    font-size: 0.9rem;
   }
 
   .eyebrow {
     text-transform: uppercase;
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     letter-spacing: 0.08em;
     color: #7dd3fc;
     margin: 0;
@@ -1493,7 +1916,7 @@
 
   .hero-actions {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.5rem;
     flex-wrap: wrap;
     align-items: flex-end;
   }
@@ -1533,12 +1956,6 @@
     margin-bottom: 0.5rem;
   }
 
-  .hint {
-    margin: 0;
-    color: #8da0bf;
-    font-size: 0.9rem;
-  }
-
   .course-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -1559,12 +1976,21 @@
     color: #e5e7eb;
     text-align: left;
     font-size: 0.9rem;
+    min-height: 44px;
+    transition: border-color 0.2s, background 0.2s;
   }
 
   .course-wrap > button.active {
     border-color: var(--accent, #7dd3fc);
     background: rgba(125, 211, 252, 0.08);
     color: #f8fafc;
+  }
+
+  .course-count {
+    display: block;
+    font-size: 0.72rem;
+    color: #8da0bf;
+    margin-top: 0.1rem;
   }
 
   .course-edit-btn {
@@ -1578,6 +2004,10 @@
     color: rgba(255, 255, 255, 0.45);
     font-size: 0.75rem;
     line-height: 1;
+    min-height: 28px;
+    min-width: 28px;
+    display: grid;
+    place-items: center;
   }
 
   .course-editing {
@@ -1606,6 +2036,10 @@
     padding: 0.1rem 0.2rem;
     font-size: 0.9rem;
     flex-shrink: 0;
+    min-height: 44px;
+    min-width: 44px;
+    display: grid;
+    place-items: center;
   }
 
   .add-course-btn {
@@ -1618,6 +2052,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    min-height: 44px;
   }
 
   .course-pill {
@@ -1644,24 +2079,70 @@
   }
 
   .toolbar {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 0.75rem;
+    display: flex;
+    gap: 0.5rem;
     margin: 0.5rem 0 0.75rem 0;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .toolbar-btns {
+    display: flex;
+    gap: 0.35rem;
+    flex-shrink: 0;
   }
 
   .search {
-    display: block;
+    display: flex;
+    align-items: center;
+    position: relative;
+    flex: 1;
+    min-width: 160px;
+  }
+
+  .search-icon {
+    position: absolute;
+    left: 0.65rem;
+    color: #8da0bf;
+    font-size: 0.9rem;
+    pointer-events: none;
   }
 
   .search input {
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 0.75rem;
-    padding: 0.35rem 0.75rem;
+    padding: 0.5rem 2rem 0.5rem 2rem;
     font-size: 0.85rem;
     color: #f8fafc;
     width: 100%;
+    min-height: 44px;
+  }
+
+  .search-clear {
+    position: absolute;
+    right: 0.3rem;
+    background: transparent;
+    border: none;
+    color: #8da0bf;
+    padding: 0.3rem;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    min-height: 32px;
+    min-width: 32px;
+  }
+
+  .add-student-row {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 0.75rem;
+    align-items: center;
+  }
+
+  .add-student-input {
+    flex: 1;
+    min-height: 44px;
   }
 
   .import-feedback {
@@ -1673,19 +2154,26 @@
   .student-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 0.75rem;
+    gap: 0.5rem;
+  }
+
+  .student-card-wrap {
+    position: relative;
   }
 
   .student-card {
     display: grid;
     grid-template-columns: auto 1fr auto;
     align-items: center;
-    gap: 0.2rem;
-    padding: 0.75rem;
+    gap: 0.5rem;
+    padding: 0.6rem 0.75rem;
     border-radius: 0.9rem;
     border: 1px solid rgba(255, 255, 255, 0.08);
     background: rgba(255, 255, 255, 0.03);
     color: #e5e7eb;
+    width: 100%;
+    min-height: 56px;
+    transition: border-color 0.2s, background 0.2s;
   }
 
   .student-card.active {
@@ -1693,27 +2181,123 @@
     background: rgba(74, 222, 128, 0.08);
   }
 
+  .student-info {
+    min-width: 0;
+  }
+
+  .student-meta {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .today-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.72rem;
+    color: #4ade80;
+    font-weight: 700;
+  }
+
+  .today-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #4ade80;
+    display: inline-block;
+  }
+
+  .total-count {
+    font-size: 0.72rem;
+    color: #8da0bf;
+  }
+
+  .student-edit-btn {
+    position: absolute;
+    top: 0.25rem;
+    right: 0.25rem;
+    padding: 0.15rem 0.25rem;
+    border-radius: 0.35rem;
+    border: none;
+    background: rgba(0, 0, 0, 0.35);
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 0.7rem;
+    line-height: 1;
+    min-height: 24px;
+    min-width: 24px;
+    display: grid;
+    place-items: center;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+
+  .student-card-wrap:hover .student-edit-btn,
+  .student-card-wrap:focus-within .student-edit-btn {
+    opacity: 1;
+  }
+
+  .student-editing {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    border: 1px solid #7dd3fc;
+    border-radius: 0.9rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(255, 255, 255, 0.03);
+    min-height: 56px;
+  }
+
+  .student-name-input {
+    border: none;
+    background: transparent;
+    color: #f8fafc;
+    font-size: 0.9rem;
+    padding: 0;
+    width: 100%;
+  }
+
+  .student-delete-btn {
+    border: none;
+    background: transparent;
+    color: rgba(248, 113, 113, 0.7);
+    padding: 0.1rem 0.2rem;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+    min-height: 44px;
+    min-width: 44px;
+    display: grid;
+    place-items: center;
+  }
+
   .avatar {
-    width: 42px;
-    height: 42px;
-    border-radius: 12px;
-    background: linear-gradient(135deg, #7dd3fc, #4ade80);
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent, #7dd3fc), #4ade80);
     display: grid;
     place-items: center;
     font-weight: 800;
     color: #0b1224;
+    font-size: 0.8rem;
+    flex-shrink: 0;
   }
 
   .name {
     margin: 0;
     font-weight: 700;
     color: #f8fafc;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .mini {
     margin: 0;
     color: #9fb1cc;
-    font-size: 0.9rem;
+    font-size: 0.85rem;
   }
 
   .empty {
@@ -1767,25 +2351,27 @@
 
   .pill-group {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    grid-template-columns: repeat(2, 1fr);
     gap: 0.3rem;
     align-items: stretch;
   }
 
   .pill-group button {
     border-radius: 999px;
-    padding: 0.6rem 0.9rem;
+    padding: 0.55rem 0.7rem;
     border: 1px solid rgba(255, 255, 255, 0.08);
     background: rgba(255, 255, 255, 0.03);
     color: #e5e7eb;
     font-weight: 700;
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    margin: 1px;
+    justify-content: center;
+    gap: 0.3rem;
     width: 100%;
     white-space: nowrap;
-    font-size: clamp(0.82rem, 1vw, 0.95rem);
+    font-size: 0.82rem;
+    min-height: 44px;
+    transition: background 0.15s, border-color 0.15s;
   }
 
   .pill-group button.selected {
@@ -1796,10 +2382,11 @@
   }
 
   .dot {
-    width: 10px;
-    height: 10px;
+    width: 8px;
+    height: 8px;
     border-radius: 999px;
     display: inline-block;
+    flex-shrink: 0;
   }
 
   .dot.bad {
@@ -1854,6 +2441,12 @@
     display: inline-flex;
     align-items: center;
     gap: 0.35rem;
+    min-height: 44px;
+    transition: opacity 0.15s;
+  }
+
+  button.primary:active {
+    opacity: 0.8;
   }
 
   button.primary:disabled {
@@ -1870,31 +2463,42 @@
     display: inline-flex;
     gap: 0.4rem;
     align-items: center;
+    min-height: 44px;
+    transition: background 0.15s;
+  }
+
+  button.ghost:active {
+    background: rgba(255, 255, 255, 0.15);
+  }
+
+  button.compact {
+    padding: 0.45rem 0.7rem;
+    font-size: 0.82rem;
   }
 
   textarea {
-    min-height: 90px;
+    min-height: 70px;
     resize: vertical;
   }
 
   .stamp {
     margin: 0;
     color: #9fb1cc;
-    font-size: 0.95rem;
+    font-size: 0.9rem;
   }
 
   .stamp.small {
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     color: #8da0bf;
   }
 
   .badge {
-    padding: 0.35rem 0.6rem;
-    border-radius: 0.75rem;
+    padding: 0.3rem 0.55rem;
+    border-radius: 0.65rem;
     background: rgba(125, 211, 252, 0.12);
     border: 1px solid rgba(125, 211, 252, 0.25);
     color: #f8fafc;
-    font-size: 0.9rem;
+    font-size: 0.82rem;
     display: inline-flex;
     align-items: center;
     max-width: 100%;
@@ -1906,7 +2510,7 @@
     border-color: rgba(125, 211, 252, 0.35);
     color: #e0f2fe;
     font-weight: 800;
-    font-size: 0.95rem;
+    font-size: 0.85rem;
   }
 
   .modal-backdrop {
@@ -1918,6 +2522,17 @@
     place-items: center;
     padding: 1rem;
     z-index: 20;
+    animation: fadeIn 0.2s ease;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @keyframes slideUp {
+    from { transform: translateY(30px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
   }
 
   .modal {
@@ -1930,18 +2545,44 @@
     max-height: 90vh;
     overflow: auto;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+    animation: slideUp 0.25s ease;
   }
 
   .modal-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 0.75rem;
+    gap: 0.5rem;
+  }
+
+  .modal-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .nav-btn {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 0.65rem;
+    color: #e5e7eb;
+    padding: 0.4rem;
+    display: grid;
+    place-items: center;
+    min-height: 40px;
+    min-width: 40px;
+    font-size: 1.2rem;
+    transition: background 0.15s;
+  }
+
+  .nav-btn:active {
+    background: rgba(255, 255, 255, 0.15);
   }
 
   h3 {
-    margin: 0 0 0.15rem 0;
+    margin: 0 0 0.1rem 0;
     color: #f3f4f6;
+    font-size: 1.1rem;
   }
 
   h4 {
@@ -1960,6 +2601,7 @@
     display: flex;
     flex-direction: column;
     gap: 1rem;
+    animation: slideUp 0.25s ease;
   }
 
   .export-header {
@@ -1986,6 +2628,7 @@
     width: 100%;
     min-width: 0;
     box-sizing: border-box;
+    min-height: 44px;
   }
 
   .export-actions {
@@ -2001,11 +2644,41 @@
     accent-color: #7dd3fc;
   }
 
+  .range-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .range-btn {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #f8fafc;
+    border-radius: 0.5rem;
+    min-width: 36px;
+    min-height: 36px;
+    display: grid;
+    place-items: center;
+    font-size: 1rem;
+    font-weight: 800;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+
+  .range-btn:active {
+    background: rgba(255, 255, 255, 0.2);
+  }
+
+  .range-row input[type="range"] {
+    flex: 1;
+    min-width: 0;
+  }
+
   .tabs {
     display: inline-flex;
-    gap: 0.35rem;
-    margin: 0.5rem 0 0.75rem 0;
-    padding: 0.25rem;
+    gap: 0.25rem;
+    margin: 0.5rem 0 0.5rem 0;
+    padding: 0.2rem;
     border-radius: 0.75rem;
     background: rgba(255, 255, 255, 0.02);
     border: 1px solid rgba(255, 255, 255, 0.1);
@@ -2017,9 +2690,31 @@
     background: transparent;
     color: #c7d2fe;
     font-weight: 700;
-    padding: 0.55rem 0.9rem;
+    padding: 0.5rem 0.7rem;
     border-radius: 0.65rem;
     margin-bottom: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    min-height: 40px;
+    transition: background 0.2s, box-shadow 0.2s;
+    position: relative;
+    font-size: 0.82rem;
+  }
+
+  .tab-icon {
+    font-size: 1rem;
+  }
+
+  .tab-badge {
+    background: rgba(125, 211, 252, 0.3);
+    color: #e0f2fe;
+    font-size: 0.65rem;
+    font-weight: 800;
+    padding: 0.1rem 0.35rem;
+    border-radius: 999px;
+    min-width: 18px;
+    text-align: center;
   }
 
   .tabs button.active {
@@ -2032,16 +2727,28 @@
   .tabs-row {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    justify-content: center;
     gap: 0.75rem;
     flex-wrap: wrap;
   }
 
-  .tab-actions {
-    display: inline-flex;
+  .sticky-save {
+    position: sticky;
+    bottom: 0;
+    background: linear-gradient(transparent, #0f172a 30%);
+    padding: 1rem 0 0.25rem 0;
+    display: flex;
+    gap: 0.5rem;
     align-items: center;
-    gap: 0.35rem;
-    margin-left: auto;
+    justify-content: center;
+    z-index: 5;
+  }
+
+  .save-btn {
+    flex: 1;
+    max-width: 300px;
+    justify-content: center;
+    font-size: 0.95rem;
   }
 
   .modal-grid {
@@ -2055,8 +2762,8 @@
   .modal-history {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
-    max-height: clamp(240px, 40vh, 420px);
+    gap: 0.5rem;
+    max-height: clamp(240px, 50vh, 500px);
     overflow: auto;
     padding-right: 0.25rem;
   }
@@ -2064,11 +2771,12 @@
   .history-card {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 0.85rem;
-    padding: 0.6rem 0.75rem;
+    padding: 0.5rem 0.65rem;
     background: rgba(255, 255, 255, 0.03);
     display: flex;
     flex-direction: column;
-    gap: 0.35rem;
+    gap: 0.25rem;
+    transition: border-color 0.2s;
   }
 
   .history-top {
@@ -2084,23 +2792,24 @@
     align-items: center;
     gap: 0.5rem;
     flex-wrap: wrap;
-    margin-top: 0.15rem;
+    margin-top: 0.1rem;
   }
 
   .note-value {
     font-weight: 800;
     color: #f8fafc;
-    font-size: 1.05rem;
+    font-size: 1rem;
   }
 
   .note-line.compact {
     flex: 1;
-    min-width: 160px;
+    min-width: 140px;
   }
 
   .comment {
-    margin: 0.15rem 0 0 0;
+    margin: 0.1rem 0 0 0;
     color: #cbd5e1;
+    font-size: 0.85rem;
   }
 
   .ghost.icon {
@@ -2111,6 +2820,28 @@
   .ghost.danger {
     border-color: rgba(248, 113, 113, 0.4);
     color: #fecdd3;
+    font-size: 0.8rem;
+    padding: 0.35rem 0.6rem;
+  }
+
+  .ghost.danger-confirm {
+    border-color: #f87171;
+    background: rgba(248, 113, 113, 0.2);
+    color: #fecdd3;
+    font-size: 0.8rem;
+    font-weight: 800;
+    padding: 0.35rem 0.6rem;
+    animation: pulse 0.5s;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+
+  .load-more {
+    align-self: center;
+    margin-top: 0.25rem;
   }
 
   .merit-field .toggle {
@@ -2125,6 +2856,8 @@
     background: rgba(255, 255, 255, 0.04);
     color: #e5e7eb;
     font-weight: 700;
+    min-height: 44px;
+    transition: background 0.15s, border-color 0.15s;
   }
 
   .toggle.on {
@@ -2150,6 +2883,7 @@
     background: rgba(255, 255, 255, 0.03);
     position: relative;
     cursor: pointer;
+    min-height: 36px;
   }
 
   .switch input {
@@ -2185,7 +2919,10 @@
   .course-wrap button,
   .add-course-btn,
   .tabs button,
-  .toggle {
+  .toggle,
+  .nav-btn,
+  .range-btn,
+  .search-clear {
     cursor: pointer;
   }
 
@@ -2201,6 +2938,11 @@
   }
 
   @media (max-width: 600px) {
+    main.page {
+      padding: 0.75rem;
+      gap: 0.75rem;
+    }
+
     .modal-backdrop {
       display: flex;
       flex-direction: column;
@@ -2212,8 +2954,9 @@
     .modal {
       max-width: 100%;
       width: 100%;
-      max-height: 92vh;
+      max-height: 94vh;
       border-radius: 1.25rem 1.25rem 0 0;
+      padding: 0.75rem;
     }
 
     .export-card {
@@ -2226,14 +2969,54 @@
       align-items: stretch;
     }
 
-    .tab-actions {
-      width: 100%;
-      justify-content: flex-end;
+    .tabs button {
+      padding: 0.45rem 0.55rem;
+      font-size: 0.78rem;
     }
 
-    .tabs button {
-      padding: 0.45rem 0.65rem;
+    .tab-icon {
+      font-size: 0.9rem;
+    }
+
+    .student-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .course-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+
+    .pill-group {
+      grid-template-columns: repeat(2, 1fr);
+    }
+
+    .modal-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .sticky-save {
+      padding: 0.75rem 0 0.5rem 0;
+    }
+
+    .hero-actions {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .hero-actions button {
+      justify-content: center;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+    }
+
+    .lede {
       font-size: 0.82rem;
+    }
+
+    .student-edit-btn {
+      opacity: 1;
     }
   }
 </style>
