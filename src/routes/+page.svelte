@@ -2103,6 +2103,8 @@
   .search-icon {
     position: absolute;
     left: 0.65rem;
+    top: 50%;
+    transform: translateY(-50%);
     color: #8da0bf;
     font-size: 0.9rem;
     pointer-events: none;
@@ -2122,6 +2124,8 @@
   .search-clear {
     position: absolute;
     right: 0.3rem;
+    top: 50%;
+    transform: translateY(-50%);
     background: transparent;
     border: none;
     color: #8da0bf;
